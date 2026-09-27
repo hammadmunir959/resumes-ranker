@@ -1,18 +1,4 @@
-"""Pure helpers, split by what they are helpers for.
-
-- :mod:`~app.utils.jev_utils` - small decisions about the Decisions API call:
-  which model to fall back to, whether a ``Retry-After`` is usable, what to do
-  with a ``200`` that is not JSON.
-- :mod:`~app.utils.ranking_utils` - the ranking pipeline as plain functions,
-  plus the policy constants they apply.
-
-Nothing here holds state or performs I/O, which is what keeps
-:mod:`app.services` down to the two objects that do: ``JevClient`` and
-``ResumeRanker``.
-
-Import from ``app.utils`` rather than the submodules; this re-export is the
-supported surface.
-"""
+"""Pure helper functions for Jev decisions and resume ranking."""
 
 from __future__ import annotations
 

@@ -7,6 +7,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app import config
+from app.api.limiter import limiter
 from app.main import create_app
 from app.config import Settings, get_settings
 from app.exceptions import (
@@ -335,3 +336,17 @@ def test_openapi_schema_builds():
     assert "/rank/single" in schema["paths"]
     assert "/rank/batch" in schema["paths"]
     assert "/health" in schema["paths"]
+
+
+def test_rate_limit_exceeded_returns_429():
+    app = build()
+    try:
+        with TestClient(app) as client:
+            statuses = [
+                client.post("/rank/single", json=single_body()).status_code
+                for _ in range(65)
+            ]
+        assert 429 in statuses
+    finally:
+        limiter.reset()
+

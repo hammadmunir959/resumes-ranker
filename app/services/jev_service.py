@@ -1,36 +1,4 @@
-"""Async client for the TypeSafe Jev Decisions API on OpenRouter.
-
-This layer knows nothing about resumes. It takes questions, asks the model, and
-returns a typed :class:`~app.schemas.JevResponse`, handling rate limiting,
-retries, and error classification along the way. Use it directly for anything
-Jev can answer; :mod:`app.services.ranking_service` builds the resume-specific
-questions on top.
-
-This module holds the client objects and the transport behaviour - retries,
-backoff, rate limiting, error classification, and the fallback model. The small
-decisions that behaviour is built from are in :mod:`app.utils.jev_utils`, the
-request and response shapes are in :mod:`app.schemas.jev_schemas`, and the
-numbers the client is tuned with are the defaults on
-:class:`app.config.Settings`.
-
-Retry policy, and why it is not simply "retry everything":
-
-* ``429`` and ``5xx`` are retried with exponential backoff, honoring
-  ``Retry-After``.
-* ``402`` is retried **only** when the error says the in-flight spend cap was
-  hit, because that cap clears itself. An empty balance never will, so retrying
-  it just delays the real message.
-* ``401``, ``403``, and other ``4xx`` fail immediately. They are deterministic,
-  so four identical attempts would bury the actual cause.
-
-A second model is tried when the failure is plausibly the model's rather than the
-account's. ``JEV_FALLBACK_MODEL`` is used for that, and an empty value turns the
-fallback off. Passing ``model=`` to :meth:`JevClient.decide` means you want
-exactly that model, so it is not substituted.
-
-The clock and sleep functions are injectable, which is what lets the tests
-exercise backoff and rate limiting without real delays.
-"""
+"""Async client for the TypeSafe Jev Decisions API on OpenRouter."""
 
 from __future__ import annotations
 
@@ -65,53 +33,9 @@ logger = logging.getLogger(__name__)
 #: Advertised to OpenRouter so the account's usage page is readable.
 APP_TITLE = "resumes-ranker"
 
-# --------------------------------------------------------------------------- #
-# Rate limiting
-# --------------------------------------------------------------------------- #
-
-class RateLimiter:
-    """Sliding window: at most ``rate`` acquisitions per ``period`` seconds.
-
-    The wait happens *outside* the lock. Holding it while sleeping, the obvious
-    implementation, would let one throttled caller block every other caller from
-    even re-checking the window.
-    """
-
-    def __init__(
-        self,
-        rate: float,
-        period: float = 1.0,
-        *,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    ):
-        if rate <= 0:
-            raise ValueError("rate must be > 0")
-        self.rate = rate
-        self.period = period
-        self._clock = clock
-        self._sleep = sleep
-        self._times: list[float] = []
-        self._lock = asyncio.Lock()
-
-    async def acquire(self) -> None:
-        while True:
-            async with self._lock:
-                now = self._clock()
-                self._times = [t for t in self._times if now - t < self.period]
-                if len(self._times) < self.rate:
-                    self._times.append(now)
-                    return
-                wait = self.period - (now - self._times[0])
-            await self._sleep(max(wait, 0.001))
-
-
-# --------------------------------------------------------------------------- #
-# Async client
-# --------------------------------------------------------------------------- #
 
 class JevClient:
-    """Async client for ``POST /api/alpha/decisions``."""
+    """Async client for POST /api/alpha/decisions."""
 
     def __init__(
         self,
@@ -119,14 +43,12 @@ class JevClient:
         *,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         client: Optional[httpx.AsyncClient] = None,
-        clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter: Callable[[], float] = random.random,
     ):
         self.settings = settings
         self._sleep = sleep
         self._jitter = jitter
-        self.limiter = RateLimiter(settings.jev_max_rps, clock=clock, sleep=sleep)
         self._owns_client = client is None
         self.client = client or httpx.AsyncClient(
             transport=transport, timeout=settings.jev_timeout
@@ -150,38 +72,20 @@ class JevClient:
         session_id: Optional[str] = None,
         model: Optional[str] = None,
     ) -> JevResponse:
-        """Ask the model to answer every question against one state.
-
-        ``state`` is the subject being judged, and ``questions`` maps the answer
-        key to the question itself, so the reply can be matched back up.
-
-        Every question in one request is answered in parallel and the answers
-        cannot see each other, so unrelated questions about the same state cost
-        nothing extra to batch together.
-        """
+        """Ask the model to answer every question against one state."""
         if not questions:
             raise ValueError("at least one question is required")
         body: dict[str, Any] = {"state": state, "questions": dict(questions)}
         if metadata:
             body["metadata"] = dict(metadata)
         if session_id:
-            # OpenRouter groups these in Broadcast and its private logs, and
-            # never forwards the value to the provider.
             body["session_id"] = session_id[:256]
         return await self._call(model=model, body=body)
 
     async def _call(self, *, model: Optional[str], body: dict[str, Any]) -> JevResponse:
-        """Ask one model, falling back to another if this one is the problem.
-
-        The fallback runs only for the failures in :data:`FALLBACK_ERRORS`. A bad
-        key or an empty balance belongs to the account rather than the model, and
-        the fallback would be turned away for exactly the same reason, so those
-        raise straight through instead of doubling the requests.
-        """
+        """Ask one model, falling back to another if this one is the problem."""
         primary = model or self.settings.jev_model
         fallback = resolve_fallback(self.settings, primary, explicit=model)
-        # Shared across both passes so the reported attempt count is the number
-        # of HTTP requests actually made, not the index within one pass.
         attempts = [0]
 
         try:
@@ -210,7 +114,6 @@ class JevClient:
         max_attempts = self.settings.jev_max_retries
 
         for attempt in range(1, max_attempts + 1):
-            await self.limiter.acquire()
             attempts[0] += 1
             try:
                 response = await self.client.post(
@@ -247,6 +150,7 @@ class JevClient:
         )
 
     def _headers(self) -> dict[str, str]:
+        """Return HTTP headers for Decisions API requests."""
         return {
             "Authorization": f"Bearer {self.settings.openrouter_api_key}",
             "Content-Type": "application/json",
@@ -259,8 +163,6 @@ class JevClient:
             return min(max(error.retry_after, 0.0), self.settings.jev_backoff_max)
         base = self.settings.jev_backoff_base * (2 ** (attempt - 1))
         capped = min(base, self.settings.jev_backoff_max)
-        # Jitter keeps a burst of concurrent candidates from retrying in lockstep
-        # and re-triggering the same rate limit.
         return capped * (0.5 + 0.5 * self._jitter())
 
     def classify(self, response: httpx.Response) -> JevError:
@@ -296,6 +198,7 @@ class JevClient:
 
     @staticmethod
     def _parse(body: Any, attempts: int = 1) -> JevResponse:
+        """Parse Decisions API JSON response body into a JevResponse."""
         if not isinstance(body, dict):
             raise JevProtocolError("Decisions API returned a non-object body")
         answers = body.get("answers")
@@ -325,17 +228,8 @@ class JevClient:
         await self.aclose()
 
 
-# --------------------------------------------------------------------------- #
-# Blocking client
-# --------------------------------------------------------------------------- #
-
 class JevSyncClient:
-    """Blocking client, for scripts and notebooks.
-
-    A thin wrapper over a private event loop, so synchronous callers get the
-    same retry and rate-limiting behavior as the async client rather than a
-    second implementation that could drift.
-    """
+    """Synchronous wrapper for JevClient."""
 
     def __init__(self, settings: Optional[Settings] = None, **kwargs: Any):
         from app.config import get_settings
@@ -347,11 +241,12 @@ class JevSyncClient:
     def from_settings(
         cls, settings: Optional[Settings] = None, **kwargs: Any
     ) -> "JevSyncClient":
+        """Build a sync client from settings."""
         return cls(settings, **kwargs)
 
     @property
     def client(self) -> JevClient:
-        """The underlying async client, for parity with :class:`JevClient`."""
+        """The underlying async client."""
         return self._client
 
     def decide(
@@ -363,7 +258,7 @@ class JevSyncClient:
         session_id: Optional[str] = None,
         model: Optional[str] = None,
     ) -> JevResponse:
-        # Serialized: one private loop cannot be entered from two threads.
+        """Execute decision synchronously."""
         with self._lock:
             return asyncio.run(
                 self._client.decide(
@@ -373,15 +268,15 @@ class JevSyncClient:
             )
 
     def close(self) -> None:
+        """Close the synchronous client."""
         with self._lock:
             asyncio.run(self._client.aclose())
 
 
 __all__ = [
     "APP_TITLE",
-    "FALLBACK_ERRORS",  # re-exported from app.utils.jev_utils
+    "FALLBACK_ERRORS",
     "resolve_fallback",
-    "RateLimiter",
     "JevClient",
     "JevSyncClient",
     "JevError",

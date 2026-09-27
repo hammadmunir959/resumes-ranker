@@ -36,6 +36,22 @@ DEFAULT_MODEL = "typesafe/jev-1.13"
 DEFAULT_FALLBACK_MODEL = "respan/span-01-lite"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/alpha/decisions"
 
+DEFAULT_RUBRIC: tuple[str, ...] = ("Not met", "Partially met", "Fully met")
+MAX_CRITERIA: int = 50
+MAX_CANDIDATES: int = 100
+MAX_CRITERION_NAME: int = 120
+MAX_JOB_DESCRIPTION: int = 20_000
+MAX_RESUME_TEXT: int = 40_000
+MAX_APPLICATION_FORM: int = 20_000
+MAX_CANDIDATE_ID: int = 120
+
+SCORE_SCALE: float = 100.0
+GATE_THRESHOLD: float = 0.5
+GATE_MARGIN: float = 0.15
+REVIEW_CONFIDENCE_FLOOR: float = 0.60
+JEV_CONTEXT_TOKENS: int = 32_000
+CHARS_PER_TOKEN: int = 4
+
 #: Loopback hosts allowed to use plain http, so a local mock server works.
 #: Anywhere else over http would put the API key on the wire in the clear.
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -98,6 +114,7 @@ class Settings(BaseModel):
     host: str = "0.0.0.0"
     port: int = Field(default=8000, ge=1, le=65535)
     log_level: str = "INFO"
+    rate_limit: str = "60/minute"
 
     # -- construction ------------------------------------------------------- #
 
@@ -217,5 +234,19 @@ __all__ = [
     "DEFAULT_MODEL",
     "DEFAULT_FALLBACK_MODEL",
     "DEFAULT_BASE_URL",
+    "DEFAULT_RUBRIC",
+    "MAX_CRITERIA",
+    "MAX_CANDIDATES",
+    "MAX_CRITERION_NAME",
+    "MAX_JOB_DESCRIPTION",
+    "MAX_RESUME_TEXT",
+    "MAX_APPLICATION_FORM",
+    "MAX_CANDIDATE_ID",
+    "SCORE_SCALE",
+    "GATE_THRESHOLD",
+    "GATE_MARGIN",
+    "REVIEW_CONFIDENCE_FLOOR",
+    "JEV_CONTEXT_TOKENS",
+    "CHARS_PER_TOKEN",
     "ENV_PATH",
 ]

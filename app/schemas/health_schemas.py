@@ -1,9 +1,4 @@
-"""The shape of the ``/health`` response.
-
-Its own module because it is the one schema that describes this process rather
-than a ranking: it reports loaded configuration so an operator can see what a
-failing deployment was actually running. It must never carry the API key.
-"""
+"""Health check response schema."""
 
 from __future__ import annotations
 
@@ -13,12 +8,7 @@ __all__ = ["HealthResponse"]
 
 
 class HealthResponse(BaseModel):
-    """Liveness plus the configuration a client would need to debug a failure.
-
-    Reports the base URL, the primary model, and the fallback model so an
-    operator can see what the process actually loaded. The key is never
-    included, only whether one was found.
-    """
+    """Liveness and process configuration report."""
 
     status: str
     model: str

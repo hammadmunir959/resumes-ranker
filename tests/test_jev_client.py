@@ -13,7 +13,7 @@ from app.exceptions import (
     JevTransientError,
 )
 from app.schemas import JevResponse, Questions
-from app.services import JevClient, JevSyncClient, RateLimiter
+from app.services import JevClient, JevSyncClient
 from app.testing import MockTransport, ScriptedTransport, mock_body
 
 QUESTION = {"g": {"type": "noul", "instructions": "Meets it?"}}
@@ -276,49 +276,6 @@ def test_backoff_grows_and_is_capped():
     seen = [jev._backoff(attempt, None) for attempt in (1, 2, 3, 4, 5)]
     # jitter is pinned to 0.0, so each delay is half the nominal value
     assert seen == [0.5, 1.0, 2.0, 2.0, 2.0], seen
-
-
-# --- Rate limiting ---------------------------------------------------------- #
-
-def test_rate_limiter_waits_outside_the_lock():
-    # A fake clock makes the window deterministic and instant.
-    now = [0.0]
-    waits = []
-
-    async def sleep(seconds: float) -> None:
-        waits.append(seconds)
-        now[0] += seconds
-
-    limiter = RateLimiter(2, period=1.0, clock=lambda: now[0], sleep=sleep)
-
-    async def scenario():
-        await limiter.acquire()
-        await limiter.acquire()
-        await limiter.acquire()  # third in the same second must wait
-
-    asyncio.run(scenario())
-    assert len(waits) == 1, "only the third acquisition should have waited"
-    assert waits[0] > 0
-
-
-def test_rate_limiter_rejects_a_non_positive_rate():
-    assert _reject(RateLimiter, 0)
-
-
-def test_rate_limiter_releases_the_window_over_time():
-    now = [0.0]
-
-    async def sleep(seconds: float) -> None:
-        now[0] += seconds
-
-    limiter = RateLimiter(1, period=1.0, clock=lambda: now[0], sleep=sleep)
-
-    async def scenario():
-        await limiter.acquire()
-        await limiter.acquire()  # waits out the window
-
-    asyncio.run(scenario())
-    assert now[0] >= 1.0
 
 
 # --- Construction and cleanup ----------------------------------------------- #

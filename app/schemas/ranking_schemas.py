@@ -1,12 +1,4 @@
-"""What this program judges: the inputs, the per-candidate results, and the
-envelopes the API wraps them in.
-
-Separate from :mod:`app.schemas.jev_schemas` because these shapes are ours. They
-describe the ranking job and its answer, and they are what the CLI, the API, and
-a library caller all pass around.
-
-Each cap below is enforced by the model that uses it.
-"""
+"""Domain and API schemas for resume ranking."""
 
 from __future__ import annotations
 
@@ -14,26 +6,17 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.config import (
+    DEFAULT_RUBRIC,
+    MAX_APPLICATION_FORM,
+    MAX_CANDIDATE_ID,
+    MAX_CANDIDATES,
+    MAX_CRITERIA,
+    MAX_CRITERION_NAME,
+    MAX_JOB_DESCRIPTION,
+    MAX_RESUME_TEXT,
+)
 from app.schemas.jev_schemas import Usage
-
-# --- Caps --------------------------------------------------------------------
-# Declared here because these models are what enforce them, and a bound baked
-# into a ``Field`` cannot be varied per instance. The cost of a request scales
-# with the number of criteria and candidates, so refusing an oversized payload
-# here is what stops a request that would be slow and expensive rather than
-# merely invalid.
-
-MAX_CRITERIA = 50
-MAX_CANDIDATES = 100
-MAX_CRITERION_NAME = 120
-MAX_JOB_DESCRIPTION = 20_000
-MAX_RESUME_TEXT = 40_000
-MAX_APPLICATION_FORM = 20_000
-MAX_CANDIDATE_ID = 120
-
-#: Ordered outcome levels, lowest to highest. Indices are what a ``score``
-#: question reports, so the order is significant.
-DEFAULT_RUBRIC: tuple[str, ...] = ("Not met", "Partially met", "Fully met")
 
 __all__ = [
     "DEFAULT_RUBRIC",
@@ -55,25 +38,16 @@ __all__ = [
 ]
 
 
-class _Frozen(BaseModel):
-    """Immutable base, so a criterion cannot change after scoring starts."""
+class Criterion(BaseModel):
+    """One job requirement evaluated against candidates."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
-
-
-# --------------------------------------------------------------------------- #
-# Inputs
-# --------------------------------------------------------------------------- #
-
-class Criterion(_Frozen):
-    """One thing being judged, such as "5+ years of Python experience"."""
 
     id: str = Field(min_length=1, max_length=MAX_CRITERION_NAME)
     name: str = Field(min_length=1, max_length=MAX_CRITERION_NAME)
     description: str = Field(default="", max_length=MAX_JOB_DESCRIPTION)
     required: bool = False
     weight: float = Field(default=1.0, ge=0.0, le=1000.0)
-    #: Ordered outcomes, lowest to highest. Two or more entries.
     rubric: tuple[str, ...] = DEFAULT_RUBRIC
 
     @field_validator("id", "name")
@@ -94,37 +68,29 @@ class Criterion(_Frozen):
 
     @model_validator(mode="after")
     def _coherent(self) -> "Criterion":
-        # A required criterion is a gate, and gates short-circuit the pipeline,
-        # so a weight on one would be a number nothing ever reads.
         if not self.required and self.weight <= 0:
             raise ValueError("an optional criterion needs weight > 0")
         return self
 
     @property
     def max_index(self) -> float:
-        """Highest rubric index, the value a perfect score would report."""
         return float(len(self.rubric) - 1)
 
     @property
     def is_gate(self) -> bool:
-        """Gates are pass/fail; everything else is a weighted score."""
         return self.required
 
     def rubric_at(self, index: float) -> str:
-        """Human label for a fractional rubric index, clamped to the range."""
-        position = round(index)
-        position = max(0, min(position, len(self.rubric) - 1))
-        return self.rubric[position]
+        return self.rubric[max(0, min(round(index), len(self.rubric) - 1))]
 
     def weighted_score(self, index: float) -> float:
-        """Turn a rubric index into a 0.0-1.0 fraction of the maximum."""
-        if self.max_index <= 0:
-            return 0.0
-        return max(0.0, min(index / self.max_index, 1.0))
+        return max(0.0, min(index / self.max_index, 1.0)) if self.max_index > 0 else 0.0
 
 
-class Candidate(_Frozen):
-    """One resume, plus any application-form text for the same person."""
+class Candidate(BaseModel):
+    """Candidate resume and application details."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     candidate_id: str = Field(min_length=1, max_length=MAX_CANDIDATE_ID)
     resume_text: str = Field(min_length=1, max_length=MAX_RESUME_TEXT)
@@ -140,41 +106,28 @@ class Candidate(_Frozen):
 
     @property
     def text_for_matching(self) -> str:
-        """Resume and form together, since both can evidence a criterion."""
         if self.application_form_text.strip():
             return f"{self.resume_text}\n\n--- Application form ---\n{self.application_form_text}"
         return self.resume_text
 
     def estimated_tokens(self, chars_per_token: int = 4) -> int:
-        """Rough prompt size, for cost projection only."""
         return max(1, len(self.text_for_matching) // chars_per_token)
 
 
-# --------------------------------------------------------------------------- #
-# Outputs
-# --------------------------------------------------------------------------- #
-
 class CriterionOutcome(BaseModel):
-    """The result for one criterion, as shown in the per-candidate breakdown."""
+    """Evaluation outcome for one criterion on a candidate."""
 
     model_config = ConfigDict(extra="forbid")
 
     criterion_id: str
     name: str
     required: bool
-    #: For a gate, whether it passed. None for a weighted score, which is not
-    #: pass/fail.
     passed: Optional[bool] = None
-    #: The rubric level the model landed on.
     label: str = ""
-    #: Rubric index, or the yes-probability for a gate.
     raw_score: float = 0.0
-    #: 0-100, always populated so reports need no per-row branching.
     score_0_100: float = 0.0
-    #: The model's confidence in this answer.
     confidence: Optional[float] = None
     needs_review: bool = False
-    #: Set when this criterion could not be evaluated.
     error: Optional[str] = None
 
     @property
@@ -183,40 +136,24 @@ class CriterionOutcome(BaseModel):
 
 
 class CandidateScore(BaseModel):
-    """Everything known about one candidate after ranking."""
+    """Evaluation results and overall score for one candidate."""
 
     model_config = ConfigDict(extra="forbid")
 
     candidate_id: str
     gate_passed: bool = True
-    #: The model that actually answered. Differs from the configured primary when
-    #: the Jev service fell back, so a report cannot claim the wrong model.
     model: str = ""
-    #: 0-100 weighted score, or None when no weighted criterion contributed.
-    #: None is different from 0.0: 0.0 means "scored and earned nothing", while
-    #: None means there was nothing to score, as for a job of pure gates.
     overall_score: Optional[float] = None
-    #: Ids of the required criteria that failed.
     failed_gates: list[str] = Field(default_factory=list)
-    #: True when a gate failed or the result is too uncertain to trust.
     needs_review: bool = False
     cost_usd: Optional[float] = None
-    #: How many HTTP attempts the upstream call took.
     attempts: int = 0
     per_criterion: list[CriterionOutcome] = Field(default_factory=list)
-    #: Set when the candidate could not be scored at all.
     error: Optional[str] = None
-    #: Token counts, when the provider reported them.
     usage: Optional[Usage] = None
 
     @property
     def scored(self) -> bool:
-        """True when the model answered and a result was produced.
-
-        Deliberately does not require ``overall_score``: a job made only of
-        required criteria has nothing to weigh, so a passing candidate is fully
-        scored even though there is no number to sort it by.
-        """
         return self.error is None
 
     @classmethod
@@ -227,7 +164,6 @@ class CandidateScore(BaseModel):
         *,
         failed_gates: Optional[list[str]] = None,
     ) -> "CandidateScore":
-        """A candidate that could not be scored."""
         return cls(
             candidate_id=candidate_id,
             gate_passed=not failed_gates,
@@ -238,11 +174,7 @@ class CandidateScore(BaseModel):
 
 
 class RankingResult(BaseModel):
-    """A ranked batch, plus the cost of producing it.
-
-    Both ``/rank/single`` and ``/rank/batch`` return this shape; single is
-    simply a batch of one, which keeps clients from handling two formats.
-    """
+    """Overall ranking result for a pool of candidates."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -250,7 +182,6 @@ class RankingResult(BaseModel):
     results: list[CandidateScore] = Field(default_factory=list)
     total_cost_usd: Optional[float] = None
     elapsed_seconds: float = 0.0
-    #: Candidates excluded before scoring, e.g. duplicates.
     skipped: list[str] = Field(default_factory=list)
 
     @property
@@ -262,29 +193,12 @@ class RankingResult(BaseModel):
         return sum(1 for result in self.results if result.error)
 
     def best(self) -> Optional[CandidateScore]:
-        """The strongest candidate: passing, then highest score.
+        passing = [r for r in self.results if r.gate_passed and r.error is None]
+        return max(passing, key=lambda r: r.overall_score or 0.0) if passing else None
 
-        Falls back to any passing candidate when nothing was weighed, which is
-        the normal case for a job defined purely by hard requirements.
-        """
-        passing = [
-            r for r in self.results if r.gate_passed and r.error is None
-        ]
-        if not passing:
-            return None
-        return max(passing, key=lambda r: r.overall_score or 0.0)
-
-
-# --------------------------------------------------------------------------- #
-# API envelopes
-# --------------------------------------------------------------------------- #
 
 class RankRequestBase(BaseModel):
-    """Fields shared by the single and batch endpoints.
-
-    Both endpoints take the same job and the same criteria, so they inherit the
-    validation rather than each carrying a copy of it.
-    """
+    """Base request envelope with common validation."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -302,37 +216,30 @@ class RankRequestBase(BaseModel):
     @classmethod
     def _unique_ids(cls, value: tuple[Criterion, ...]) -> tuple[Criterion, ...]:
         seen: set[str] = set()
-        duplicates: set[str] = set()
-        for criterion in value:
-            if criterion.id in seen:
-                duplicates.add(criterion.id)
-            seen.add(criterion.id)
+        duplicates: set[str] = {c.id for c in value if c.id in seen or seen.add(c.id)}
         if duplicates:
             raise ValueError(f"duplicate criterion ids: {sorted(duplicates)}")
         return value
 
 
 class RankSingleRequest(RankRequestBase):
-    """Rank one candidate."""
+    """Request payload for ranking a single candidate."""
 
     candidate: Candidate
 
 
 class RankBatchRequest(RankRequestBase):
-    """Rank several candidates, concurrently, in one call."""
+    """Request payload for ranking a batch of candidates."""
 
     candidates: tuple[Candidate, ...] = Field(min_length=1, max_length=MAX_CANDIDATES)
-    #: Overrides the configured concurrency for this call only.
     max_concurrency: Optional[int] = Field(default=None, ge=1, le=64)
 
     @model_validator(mode="after")
     def _unique_candidate_ids(self) -> "RankBatchRequest":
         seen: set[str] = set()
-        duplicates: set[str] = set()
-        for candidate in self.candidates:
-            if candidate.candidate_id in seen:
-                duplicates.add(candidate.candidate_id)
-            seen.add(candidate.candidate_id)
+        duplicates: set[str] = {
+            c.candidate_id for c in self.candidates if c.candidate_id in seen or seen.add(c.candidate_id)
+        }
         if duplicates:
             raise ValueError(f"duplicate candidate ids: {sorted(duplicates)}")
         return self

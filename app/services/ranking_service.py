@@ -1,26 +1,4 @@
-"""Resume ranking built on the Jev decision model.
-
-This module holds the one stateful object on the ranking side,
-:class:`ResumeRanker`: it owns the Jev client, the concurrency, and the
-sequencing. The work itself - how job requirements map to Jev questions, and how
-answers become a gate decision and a weighted score - is in
-:mod:`app.utils.ranking_utils` as pure functions, which is what makes it
-testable without a client.
-
-How a ranking works
--------------------
-1. A job's requirements are a list of weighted :class:`~app.schemas.Criterion`.
-2. Each criterion becomes one Jev question, built once per batch:
-   - ``required=True``  -> a ``noul`` question; the answer is a probability of
-     "yes" and acts as a hard gate.
-   - ``required=False`` -> a ``score`` question on an ordered rubric; the answer
-     is normalized to 0-100 and combined into a weighted average.
-3. Every candidate is one Decisions request containing all of its questions, so
-   cost scales with the number of candidates, not criteria x candidates.
-
-Use :mod:`app.services.jev_service` directly if you need Jev for something else
-than ranking.
-"""
+"""Resume ranking service built on the Jev decision model."""
 
 from __future__ import annotations
 
@@ -76,7 +54,7 @@ class ResumeRanker:
         criteria: Sequence[Criterion],
         candidate: Candidate,
     ) -> CandidateScore:
-        """Score one candidate. Upstream errors are raised, never swallowed."""
+        """Score one candidate against job criteria."""
         result = await self.rank_batch(job_description, criteria, [candidate])
         return result.results[0]
 
@@ -90,13 +68,7 @@ class ResumeRanker:
         *,
         max_concurrency: Optional[int] = None,
     ) -> RankingResult:
-        """Score a pool concurrently. Gated-out candidates sort last.
-
-        A transient failure (429, 5xx, a timeout) marks just that one candidate
-        as errored and the rest of the pool still ranks. A systemic failure -
-        bad key, no credit, a rejected request shape - aborts the batch, since
-        retrying it per candidate would only produce the same answer N times.
-        """
+        """Score a candidate pool concurrently."""
         if not candidates:
             raise InputValidationError("no candidates to rank")
         if len(candidates) > self.settings.jev_max_batch_size:
@@ -155,11 +127,7 @@ class ResumeRanker:
         candidates: Sequence[Candidate],
         job_description: str,
     ) -> None:
-        """Reject a request that cannot fit in Jev's context window.
-
-        Cheaper and clearer to catch here than to discover it as a 400 from the
-        provider after paying for a partial run.
-        """
+        """Reject a request that cannot fit in Jev's context window."""
         questions = build_questions(criteria)
         overhead = estimate_tokens(questions) + estimate_tokens(
             {"requirements": [c.name for c in criteria]}
@@ -175,6 +143,7 @@ class ResumeRanker:
                 )
 
     async def aclose(self) -> None:
+        """Close ranker and underlying Jev client."""
         await self.jev.aclose()
 
 

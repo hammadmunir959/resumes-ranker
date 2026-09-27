@@ -1,17 +1,4 @@
-"""Every error this project raises, in one place.
-
-Each class declares the HTTP status and machine-readable code the API should
-return, so ``app/api.py`` needs a single exception handler and a lookup table
-rather than a hand-maintained mapping that can drift out of sync.
-
-The split that matters for callers:
-
-* :class:`InputValidationError` - the request is wrong. The caller fixes it.
-* :class:`ConfigError` - this deployment is wrong. An operator fixes it.
-* :class:`JevError` and subclasses - OpenRouter refused or failed. Retrying
-  helps only for :class:`JevTransientError`; the rest will fail identically
-  forever, which is why the retry logic keys off exactly that distinction.
-"""
+"""Project exception hierarchy with HTTP status codes and payloads."""
 
 from __future__ import annotations
 
@@ -19,19 +6,21 @@ from typing import Any, ClassVar, Optional
 
 
 class RankerError(RuntimeError):
-    """Base class for everything this project raises."""
+    """Base exception for all application errors."""
 
-    #: HTTP status the API returns for this error.
     http_status: ClassVar[int] = 500
-    #: Stable identifier clients can branch on.
     error_code: ClassVar[str] = "internal_error"
 
-    def __init__(self, message: str, *, status_code: Optional[int] = None,
-                 retry_after: Optional[float] = None, detail: Optional[dict[str, Any]] = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        retry_after: Optional[float] = None,
+        detail: Optional[dict[str, Any]] = None,
+    ):
         super().__init__(message)
-        #: HTTP status reported by the upstream provider, when there was one.
         self.status_code = status_code
-        #: Seconds to wait, taken from a ``Retry-After`` header.
         self.retry_after = retry_after
         self.detail = detail or {}
 
@@ -41,7 +30,7 @@ class RankerError(RuntimeError):
         return False
 
     def to_payload(self) -> dict[str, Any]:
-        """The JSON body the API returns for this error."""
+        """Serialize error to an API JSON response dict."""
         payload: dict[str, Any] = {
             "error": self.error_code,
             "detail": str(self),
@@ -53,68 +42,50 @@ class RankerError(RuntimeError):
         return payload
 
 
-# --------------------------------------------------------------------------- #
-# Caller and operator errors
-# --------------------------------------------------------------------------- #
-
 class InputValidationError(RankerError):
-    """The request cannot produce a meaningful ranking. Retrying will not help."""
+    """Request validation failure (HTTP 400)."""
 
     http_status = 400
     error_code = "invalid_request"
 
 
 class ConfigError(RankerError):
-    """The service is not configured correctly, so it cannot serve requests."""
+    """Service configuration failure (HTTP 503)."""
 
     http_status = 503
     error_code = "not_configured"
 
 
-# --------------------------------------------------------------------------- #
-# Upstream errors
-# --------------------------------------------------------------------------- #
-
 class JevError(RankerError):
-    """Base class for Decisions API failures."""
+    """Base class for Decisions API failures (HTTP 502)."""
 
     http_status = 502
     error_code = "jev_error"
 
 
 class JevAuthError(JevError):
-    """401/403 - the API key is missing, invalid, or lacks access.
-
-    A bad key fails for every request, so it is never retried.
-    """
+    """Upstream authentication failure (HTTP 502)."""
 
     http_status = 502
     error_code = "jev_auth_failed"
 
 
 class JevCreditsError(JevError):
-    """402 - the account is out of credit.
-
-    Surfaces as 402 rather than 5xx because it is unambiguous: the request was
-    fine, the account just cannot be paid for.
-    """
+    """Upstream out-of-credits failure (HTTP 402)."""
 
     http_status = 402
     error_code = "jev_out_of_credit"
 
 
 class JevProtocolError(JevError):
-    """A rejected request shape, an unreadable body, or an unparseable answer.
-
-    Retrying would return the same rejection, so these fail fast.
-    """
+    """Upstream malformed response or protocol failure (HTTP 502)."""
 
     http_status = 502
     error_code = "jev_bad_response"
 
 
 class JevTransientError(JevError):
-    """429, 5xx, a timeout, or an exhausted in-flight budget. Safe to retry."""
+    """Transient upstream failure safe to retry (HTTP 503)."""
 
     http_status = 503
     error_code = "jev_temporarily_unavailable"

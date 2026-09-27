@@ -1,12 +1,4 @@
-"""The Jev Decisions wire format: what a request contains and what comes back.
-
-Kept apart from the ranking shapes in :mod:`app.schemas.ranking_schemas` because
-these describe somebody else's API rather than anything this program decides.
-They change when Jev changes, and the ranking layer should not have to care.
-
-:data:`Question` and :class:`Questions` build the request side;
-:class:`JevResponse` and the answer models parse the response side.
-"""
+"""Jev Decisions wire format schemas."""
 
 from __future__ import annotations
 
@@ -16,8 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.exceptions import JevProtocolError
 
-#: One question, keyed by its id. A plain dict because the id is chosen by the
-#: caller and Jev's own schema is an open object.
+#: One question definition, keyed by its id.
 Question = dict[str, Any]
 
 __all__ = [
@@ -31,11 +22,7 @@ __all__ = [
 
 
 class Questions:
-    """Builders for the three question types Jev supports.
-
-    Static methods, so a caller writes ``Questions.noul(...)`` with no instance
-    and no import of a builder type.
-    """
+    """Builders for Jev Decisions question types."""
 
     @staticmethod
     def noul(
@@ -43,11 +30,7 @@ class Questions:
         true_criteria: Optional[str] = None,
         false_criteria: Optional[str] = None,
     ) -> Question:
-        """A yes/no gate answered as a probability.
-
-        ``true_criteria`` and ``false_criteria`` describe what makes the answer
-        yes and no, which is what stops the model deciding on tone.
-        """
+        """Build a yes/no gate question answered as a probability."""
         if not instructions.strip():
             raise ValueError("instructions must not be blank")
         question: Question = {"type": "noul", "instructions": instructions}
@@ -59,7 +42,7 @@ class Questions:
 
     @staticmethod
     def score(instructions: str, rubric: Sequence[str]) -> Question:
-        """A position on an ordered scale, answered as a rubric index."""
+        """Build an ordered rubric scale question."""
         if not instructions.strip():
             raise ValueError("instructions must not be blank")
         levels = [str(level) for level in rubric]
@@ -69,7 +52,7 @@ class Questions:
 
     @staticmethod
     def choice(instructions: str, options: Mapping[str, str]) -> Question:
-        """One option out of a fixed set, answered by name."""
+        """Build a multiple-choice question."""
         if not instructions.strip():
             raise ValueError("instructions must not be blank")
         if len(options) < 2:
@@ -78,11 +61,7 @@ class Questions:
 
 
 class ScoreAnswer(BaseModel):
-    """A position on an ordered rubric, with the model's full distribution.
-
-    ``score`` is the model's chosen position, which can fall between two levels.
-    ``probabilities`` and ``legend`` are the distribution behind that choice.
-    """
+    """Ordered rubric position with probability distribution."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -93,11 +72,7 @@ class ScoreAnswer(BaseModel):
     legend: dict[str, str] = Field(default_factory=dict)
 
     def expected_score(self) -> float:
-        """Mean position implied by the distribution.
-
-        Usually the same as ``score``; worth reading when the model spread its
-        probability thinly and the point estimate overstates the confidence.
-        """
+        """Calculate mean position from probability distribution."""
         if not self.probabilities:
             return self.score
         total = 0.0
@@ -110,7 +85,7 @@ class ScoreAnswer(BaseModel):
 
 
 class ChoiceAnswer(BaseModel):
-    """One selected option out of those offered."""
+    """Selected option from offered choices."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -120,7 +95,7 @@ class ChoiceAnswer(BaseModel):
 
 
 class Usage(BaseModel):
-    """Token counts and cost as reported by the provider."""
+    """Token usage and request cost."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -130,14 +105,12 @@ class Usage(BaseModel):
 
     @property
     def total_tokens(self) -> int:
+        """Sum of input and output tokens."""
         return self.input_tokens + self.output_tokens
 
 
 class JevResponse(BaseModel):
-    """One Decisions response, normalized and typed.
-
-    ``answers`` is keyed by question id, matching the ids the caller sent.
-    """
+    """Decisions API response."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -146,13 +119,12 @@ class JevResponse(BaseModel):
     cost_usd: Optional[float] = None
     input_tokens: int = 0
     output_tokens: int = 0
-    #: HTTP attempts this answer took, including the successful one.
     attempts: int = 1
-    #: The untouched body, kept for debugging. Not serialized in API responses.
     raw: dict[str, Any] = Field(default_factory=dict, repr=False)
 
     @property
     def usage(self) -> Usage:
+        """Extract Usage object from token counts and cost."""
         return Usage(
             input_tokens=self.input_tokens,
             output_tokens=self.output_tokens,
@@ -160,11 +132,12 @@ class JevResponse(BaseModel):
         )
 
     def answer(self, question_id: str) -> Optional[dict[str, Any]]:
-        """The raw answer for one question, or None if the model omitted it."""
+        """Return raw answer mapping for a question."""
         value = self.answers.get(question_id)
         return value if isinstance(value, dict) else None
 
     def confidence(self, question_id: str) -> Optional[float]:
+        """Return confidence score for a question."""
         answer = self.answer(question_id)
         if not answer:
             return None
@@ -174,7 +147,7 @@ class JevResponse(BaseModel):
         return float(value)
 
     def noul(self, question_id: str) -> float:
-        """Probability that a ``noul`` question is yes."""
+        """Return probability for a noul question."""
         answer = self.answer(question_id)
         value = answer.get("noul") if answer else None
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -185,6 +158,7 @@ class JevResponse(BaseModel):
         return float(value)
 
     def score(self, question_id: str) -> ScoreAnswer:
+        """Return ScoreAnswer for a score question."""
         answer = self.answer(question_id)
         value = answer.get("score") if answer else None
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -211,6 +185,7 @@ class JevResponse(BaseModel):
         )
 
     def choice(self, question_id: str) -> ChoiceAnswer:
+        """Return ChoiceAnswer for a choice question."""
         answer = self.answer(question_id)
         value = answer.get("choice") if answer else None
         if not isinstance(value, str):

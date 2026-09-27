@@ -1,20 +1,4 @@
-"""Every shape in the project, split by whose API it describes.
-
-Three modules, because they answer to different owners:
-
-- :mod:`~app.schemas.jev_schemas` - the Jev Decisions wire format. Somebody
-  else's API; changes when they change it.
-- :mod:`~app.schemas.ranking_schemas` - what this program judges: criteria,
-  candidates, scores, and the request envelopes the API wraps them in.
-- :mod:`~app.schemas.health_schemas` - what ``/health`` reports about this
-  process.
-
-The numeric policy those shapes are bounded by lives in :mod:`app.policy`, not
-here. This package is shapes only.
-
-Import from ``app.schemas`` rather than the submodules: this re-export is the
-supported surface, so the internal split can change without touching callers.
-"""
+"""Pydantic schemas for Jev wire format, ranking domain, and health reporting."""
 
 from __future__ import annotations
 
