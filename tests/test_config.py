@@ -174,6 +174,9 @@ def test_get_settings_wraps_the_error_as_a_config_error():
 def test_get_settings_is_cached():
     get_settings.cache_clear()
     try:
-        assert get_settings() is get_settings()
+        # A key is supplied rather than read from the environment: the point is
+        # the cache, and a machine with no .env would otherwise fail here.
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            assert get_settings() is get_settings()
     finally:
         get_settings.cache_clear()
