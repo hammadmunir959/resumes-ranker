@@ -11,13 +11,10 @@ from app.exceptions import (
     JevCreditsError,
     JevTransientError,
 )
-from app.jev_client import JevClient
+from app.services import JevClient
 from app.schemas import Candidate, CandidateScore, Criterion, JevResponse, RankingResult
-from app.service import (
-    GATE_MARGIN,
-    GATE_THRESHOLD,
-    REVIEW_CONFIDENCE_FLOOR,
-    ResumeRanker,
+from app.services import ResumeRanker
+from app.utils import (
     aggregate,
     build_questions,
     build_state,
@@ -32,6 +29,14 @@ OTHER = Criterion(id="cloud", name="Cloud", description="aws or gcp", weight=1.0
 CRITERIA = [GATE, WEIGHTED, OTHER]
 
 RESUME = "Authorized to work. Six years of python with aws and gcp deployments."
+
+#: The scoring policy lives in the service module; the tests assert against the
+#: same numbers the code uses, so a retune cannot leave the tests stale.
+from app.utils.ranking_utils import (  # noqa: E402
+    GATE_MARGIN,
+    GATE_THRESHOLD,
+    REVIEW_CONFIDENCE_FLOOR,
+)
 
 
 async def noop_sleep(_: float) -> None:
@@ -404,22 +409,18 @@ def test_a_batch_past_the_configured_limit_is_rejected():
 
 
 def test_an_oversized_request_is_caught_before_spending():
-    import app.schemas as schemas
-
-    original = schemas.MAX_RESUME_TEXT
-    schemas.MAX_RESUME_TEXT = 500_000
+    # The resume cap is a setting, but a Pydantic Field bound is fixed when the
+    # class is created, so the schema still refuses this at construction. The
+    # candidate is built with model_construct to get past that and leave the
+    # pre-flight context check as the only thing that can catch it, which is
+    # what this test is about: nothing should be sent upstream.
+    huge = Candidate.model_construct(candidate_id="huge", resume_text="x" * 200_000)
+    transport = MockTransport()
     try:
-        huge = Candidate.model_construct(
-            candidate_id="huge", resume_text="x" * 200_000
-        )
-        transport = MockTransport()
-        try:
-            asyncio.run(ranker(transport).rank_batch("Backend", CRITERIA, [huge]))
-        except InputValidationError:
-            assert transport.requests == [], "no request should have been sent"
-            return
-    finally:
-        schemas.MAX_RESUME_TEXT = original
+        asyncio.run(ranker(transport).rank_batch("Backend", CRITERIA, [huge]))
+    except InputValidationError:
+        assert transport.requests == [], "no request should have been sent"
+        return
     raise AssertionError("an oversized request should be caught up front")
 
 

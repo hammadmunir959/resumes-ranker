@@ -15,9 +15,11 @@ import time
 import httpx
 
 from app.config import Settings
-from app.jev_client import JevClient, Questions
+from app.schemas import Questions
+from app.services import JevClient
 from app.schemas import Candidate, Criterion
-from app.service import ResumeRanker, build_questions, build_state
+from app.services import ResumeRanker
+from app.utils import build_questions, build_state
 from app.testing import (
     MOCK_PATH,
     MockTransport,

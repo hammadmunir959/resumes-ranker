@@ -3,7 +3,15 @@
 This layer knows nothing about resumes. It takes questions, asks the model, and
 returns a typed :class:`~app.schemas.JevResponse`, handling rate limiting,
 retries, and error classification along the way. Use it directly for anything
-Jev can answer; :mod:`app.service` builds the resume-specific questions on top.
+Jev can answer; :mod:`app.services.ranking_service` builds the resume-specific
+questions on top.
+
+This module holds the client objects and the transport behaviour - retries,
+backoff, rate limiting, error classification, and the fallback model. The small
+decisions that behaviour is built from are in :mod:`app.utils.jev_utils`, the
+request and response shapes are in :mod:`app.schemas.jev_schemas`, and the
+numbers the client is tuned with are the defaults on
+:class:`app.config.Settings`.
 
 Retry policy, and why it is not simply "retry everything":
 
@@ -14,6 +22,11 @@ Retry policy, and why it is not simply "retry everything":
   it just delays the real message.
 * ``401``, ``403``, and other ``4xx`` fail immediately. They are deterministic,
   so four identical attempts would bury the actual cause.
+
+A second model is tried when the failure is plausibly the model's rather than the
+account's. ``JEV_FALLBACK_MODEL`` is used for that, and an empty value turns the
+fallback off. Passing ``model=`` to :meth:`JevClient.decide` means you want
+exactly that model, so it is not substituted.
 
 The clock and sleep functions are injectable, which is what lets the tests
 exercise backoff and rate limiting without real delays.
@@ -26,7 +39,7 @@ import logging
 import random
 import threading
 import time
-from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 import httpx
 
@@ -38,63 +51,19 @@ from app.exceptions import (
     JevProtocolError,
     JevTransientError,
 )
-from app.schemas import JevResponse
+from app.schemas import JevResponse, Question
+from app.utils.jev_utils import (
+    FALLBACK_ERRORS,
+    as_number,
+    json_or_raise,
+    parse_retry_after,
+    resolve_fallback,
+)
 
 logger = logging.getLogger(__name__)
 
-#: A question as Jev expects it. Kept as a plain dict so the wire format stays
-#: visible and unmangled.
-Question = dict[str, Any]
-
 #: Advertised to OpenRouter so the account's usage page is readable.
 APP_TITLE = "resumes-ranker"
-
-
-# --------------------------------------------------------------------------- #
-# Question builders
-# --------------------------------------------------------------------------- #
-
-class Questions:
-    """Builders for the three question types Jev supports.
-
-    Static methods, so a caller writes ``Questions.noul(...)`` with no instance
-    and no import of the module-level names.
-    """
-
-    @staticmethod
-    def noul(
-        instructions: str,
-        *,
-        true_criteria: str = "",
-        false_criteria: str = "",
-    ) -> Question:
-        """A yes/no question. The answer is the probability that it is yes."""
-        question: Question = {"type": "noul", "instructions": instructions}
-        if true_criteria or false_criteria:
-            question["criteria"] = {
-                "true": true_criteria or instructions,
-                "false": false_criteria or f"Does not hold: {instructions}",
-            }
-        return question
-
-    @staticmethod
-    def score(instructions: str, rubric: Sequence[str]) -> Question:
-        """An ordered scale, where index 0 is the lowest level.
-
-        The order is significant, so the best level belongs last.
-        """
-        levels = list(rubric)
-        if len(levels) < 2:
-            raise ValueError("a score question needs at least 2 rubric levels")
-        return {"type": "score", "instructions": instructions, "criteria": levels}
-
-    @staticmethod
-    def choice(instructions: str, options: Mapping[str, str]) -> Question:
-        """Pick one of several labeled options."""
-        if not options:
-            raise ValueError("a choice question needs at least one option")
-        return {"type": "choice", "instructions": instructions, "criteria": dict(options)}
-
 
 # --------------------------------------------------------------------------- #
 # Rate limiting
@@ -202,12 +171,47 @@ class JevClient:
         return await self._call(model=model, body=body)
 
     async def _call(self, *, model: Optional[str], body: dict[str, Any]) -> JevResponse:
-        payload = {"model": model or self.settings.jev_model, **body}
+        """Ask one model, falling back to another if this one is the problem.
+
+        The fallback runs only for the failures in :data:`FALLBACK_ERRORS`. A bad
+        key or an empty balance belongs to the account rather than the model, and
+        the fallback would be turned away for exactly the same reason, so those
+        raise straight through instead of doubling the requests.
+        """
+        primary = model or self.settings.jev_model
+        fallback = resolve_fallback(self.settings, primary, explicit=model)
+        # Shared across both passes so the reported attempt count is the number
+        # of HTTP requests actually made, not the index within one pass.
+        attempts = [0]
+
+        try:
+            return await self._attempt(primary, body, attempts)
+        except FALLBACK_ERRORS as exc:
+            if fallback is None:
+                raise
+            logger.warning(
+                "model %s failed (%s) - falling back to %s",
+                primary, exc, fallback,
+            )
+            try:
+                return await self._attempt(fallback, body, attempts)
+            except JevError as fallback_exc:
+                raise JevTransientError(
+                    f"model {primary} failed ({exc}) and fallback {fallback} "
+                    f"failed too ({fallback_exc})"
+                ) from fallback_exc
+
+    async def _attempt(
+        self, model: str, body: dict[str, Any], attempts: list[int]
+    ) -> JevResponse:
+        """One model's retry loop: backoff, Retry-After, then give up."""
+        payload = {"model": model, **body}
         last: Optional[JevError] = None
         max_attempts = self.settings.jev_max_retries
 
         for attempt in range(1, max_attempts + 1):
             await self.limiter.acquire()
+            attempts[0] += 1
             try:
                 response = await self.client.post(
                     self.settings.jev_base_url,
@@ -223,7 +227,7 @@ class JevClient:
                 last = JevTransientError(f"network error: {exc}")
             else:
                 if response.is_success:
-                    return self._parse(_json_or_raise(response), attempt)
+                    return self._parse(json_or_raise(response), attempts[0])
                 error = self.classify(response)
                 if not isinstance(error, JevTransientError):
                     raise error
@@ -233,13 +237,13 @@ class JevClient:
                 break
             delay = self._backoff(attempt, last)
             logger.warning(
-                "Jev call failed (attempt %d/%d): %s - retrying in %.1fs",
-                attempt, max_attempts, last, delay,
+                "Jev call to %s failed (attempt %d/%d): %s - retrying in %.1fs",
+                model, attempt, max_attempts, last, delay,
             )
             await self._sleep(delay)
 
         raise JevTransientError(
-            f"Jev call failed after {max_attempts} attempts: {last}"
+            f"Jev call to {model} failed after {max_attempts} attempts: {last}"
         )
 
     def _headers(self) -> dict[str, str]:
@@ -262,7 +266,7 @@ class JevClient:
     def classify(self, response: httpx.Response) -> JevError:
         """Map a failed response onto the narrowest error that fits."""
         status = response.status_code
-        retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+        retry_after = parse_retry_after(response.headers.get("Retry-After"))
         message = f"Decisions API returned HTTP {status}"
         limit_source: Optional[str] = None
 
@@ -302,9 +306,9 @@ class JevClient:
         return JevResponse(
             answers=answers,
             model=str(body.get("model", "")),
-            cost_usd=_number(usage.get("cost")) or 0.0,
-            input_tokens=int(_number(usage.get("input_tokens")) or 0),
-            output_tokens=int(_number(usage.get("output_tokens")) or 0),
+            cost_usd=as_number(usage.get("cost")) or 0.0,
+            input_tokens=int(as_number(usage.get("input_tokens")) or 0),
+            output_tokens=int(as_number(usage.get("output_tokens")) or 0),
             attempts=attempts,
             raw=body,
         )
@@ -373,44 +377,10 @@ class JevSyncClient:
             asyncio.run(self._client.aclose())
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-
-def _number(value: Any) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
-
-
-def _parse_retry_after(value: Optional[str]) -> Optional[float]:
-    if not value:
-        return None
-    try:
-        return max(float(value), 0.0)
-    except ValueError:
-        return None
-
-
-def _json_or_raise(response: httpx.Response) -> Any:
-    """Parse a successful body, or explain that the gateway is broken.
-
-    A ``200`` that is not JSON is a proxy or gateway returning an HTML error
-    page. It will not parse on a retry either, so this fails fast rather than
-    escaping as a bare ``JSONDecodeError``.
-    """
-    try:
-        return response.json()
-    except ValueError as exc:
-        raise JevProtocolError(
-            f"Decisions API returned a non-JSON body: {exc}"
-        ) from exc
-
-
 __all__ = [
     "APP_TITLE",
-    "Question",
-    "Questions",
+    "FALLBACK_ERRORS",  # re-exported from app.utils.jev_utils
+    "resolve_fallback",
     "RateLimiter",
     "JevClient",
     "JevSyncClient",

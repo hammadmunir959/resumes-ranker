@@ -28,11 +28,12 @@ dev = [
 # Interactive tester
 resume-ranker = "app.cli:main"
 # HTTP API server
-resume-ranker-api = "app.api:main"
+resume-ranker-api = "app.main:main"
 # Local fake Decisions API, for testing without credit
 resume-ranker-mock = "app.testing:serve"
 
 [tool.hatch.build.targets.wheel]
+# "app" pulls in app.api, app.schemas, and app.services with it.
 packages = ["app"]
 
 [tool.hatch.build.targets.sdist]

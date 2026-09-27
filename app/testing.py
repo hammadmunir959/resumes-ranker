@@ -209,10 +209,16 @@ class ScriptedTransport(httpx.AsyncBaseTransport):
             raise ValueError("need at least one scripted response")
         self.responses = list(responses)
         self.calls = 0
+        #: Payloads in call order, so a test can assert what each attempt sent.
+        self.requests: list[dict[str, Any]] = []
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         index = min(self.calls, len(self.responses) - 1)
         self.calls += 1
+        try:
+            self.requests.append(json.loads(request.content or b"{}"))
+        except ValueError:
+            self.requests.append({})
         result = self.responses[index]
         if isinstance(result, httpx.Response):
             return result

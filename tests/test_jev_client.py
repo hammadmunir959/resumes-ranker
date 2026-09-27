@@ -12,7 +12,8 @@ from app.exceptions import (
     JevProtocolError,
     JevTransientError,
 )
-from app.jev_client import JevClient, JevSyncClient, Questions, RateLimiter
+from app.schemas import JevResponse, Questions
+from app.services import JevClient, JevSyncClient, RateLimiter
 from app.testing import MockTransport, ScriptedTransport, mock_body
 
 QUESTION = {"g": {"type": "noul", "instructions": "Meets it?"}}
@@ -248,7 +249,9 @@ def test_retries_are_bounded_and_then_reported():
     transport = ScriptedTransport([(503, {"error": {"message": "down"}})])
     jev = client(transport, jev_max_retries=3)
     assert _reject(asyncio.run, jev.decide(state="x", questions=QUESTION))
-    assert transport.calls == 3
+    # Bounded per model: three attempts at the primary, then three at the
+    # fallback. Still bounded overall, just across two passes rather than one.
+    assert models_sent(transport) == ["typesafe/jev-1.13"] * 3 + ["respan/span-01-lite"] * 3
 
 
 def test_retry_after_overrides_the_backoff():
@@ -338,6 +341,143 @@ def test_sync_client_wraps_the_async_one():
         assert isinstance(sync.client, JevClient)
     finally:
         sync.close()
+
+
+# --- Fallback model --------------------------------------------------------- #
+
+FALLBACK_ANSWER = dict(ANSWER, model="respan/span-01-lite")
+
+
+def decide(transport, **overrides) -> JevResponse:
+    return asyncio.run(
+        client(transport, **overrides).decide(state="x", questions=QUESTION)
+    )
+
+
+def models_sent(transport) -> list[str]:
+    return [r.get("model") for r in transport.requests]
+
+
+def test_primary_is_tried_first_and_only():
+    transport = ScriptedTransport([ANSWER])
+    decide(transport)
+    assert models_sent(transport) == ["typesafe/jev-1.13"]
+    assert transport.calls == 1, "a healthy primary must not cost a second call"
+
+
+def test_model_not_found_falls_back_to_the_configured_model():
+    transport = ScriptedTransport([(404, {"error": {"message": "no such model"}}), FALLBACK_ANSWER])
+    response = decide(transport)
+    assert models_sent(transport) == ["typesafe/jev-1.13", "respan/span-01-lite"]
+    assert response.model == "respan/span-01-lite", "the report must not claim the primary"
+
+
+def test_a_rejected_primary_falls_back():
+    transport = ScriptedTransport([(422, {"error": {"message": "unsupported"}}), FALLBACK_ANSWER])
+    assert decide(transport).model == "respan/span-01-lite"
+
+
+def test_exhausted_transient_failures_fall_back():
+    # The primary is scripted to fail twice, then the fallback answers. Both
+    # models get their own retry budget, so the pass is 2 + 1 here.
+    transport = ScriptedTransport(
+        [(500, {"error": {"message": "boom"}}), (500, {"error": {"message": "boom"}}),
+         FALLBACK_ANSWER]
+    )
+    response = decide(transport, jev_max_retries=2)
+    assert models_sent(transport) == ["typesafe/jev-1.13"] * 2 + ["respan/span-01-lite"]
+    assert response.model == "respan/span-01-lite"
+
+
+def test_attempts_count_every_request_across_both_models():
+    transport = ScriptedTransport(
+        [(503, {"error": {"message": "down"}})] * 2 + [FALLBACK_ANSWER]
+    )
+    response = decide(transport, jev_max_retries=3)
+    assert response.attempts == 3, "2 primary attempts plus the fallback that answered"
+
+
+def test_a_bad_key_does_not_fall_back():
+    # The key is the account's, so the fallback would be refused identically.
+    transport = ScriptedTransport([(401, {"error": {"message": "bad key"}}), FALLBACK_ANSWER])
+    try:
+        decide(transport)
+    except JevAuthError:
+        pass
+    else:
+        raise AssertionError("expected JevAuthError")
+    assert transport.calls == 1
+
+
+def test_being_out_of_credit_does_not_fall_back():
+    transport = ScriptedTransport([(402, {"error": {"message": "no credits"}}), FALLBACK_ANSWER])
+    try:
+        decide(transport)
+    except JevCreditsError:
+        pass
+    else:
+        raise AssertionError("expected JevCreditsError")
+    assert transport.calls == 1
+
+
+def test_an_empty_fallback_setting_disables_the_fallback():
+    transport = ScriptedTransport([(404, {"error": {"message": "no such model"}})])
+    try:
+        decide(transport, jev_fallback_model="")
+    except JevProtocolError:
+        pass
+    else:
+        raise AssertionError("expected JevProtocolError")
+    assert transport.calls == 1
+
+
+def test_a_fallback_equal_to_the_primary_is_not_retried():
+    transport = ScriptedTransport([(404, {"error": {"message": "no such model"}})])
+    try:
+        decide(transport, jev_fallback_model="typesafe/jev-1.13")
+    except JevProtocolError:
+        pass
+    else:
+        raise AssertionError("expected JevProtocolError")
+    assert transport.calls == 1, "retrying the same model would fail identically"
+
+
+def test_an_explicit_model_is_never_substituted():
+    # Asking for a specific model means you want that model, not a substitute.
+    transport = ScriptedTransport([(404, {"error": {"message": "no such model"}})])
+    try:
+        asyncio.run(
+            client(transport).decide(state="x", questions=QUESTION, model="other/model")
+        )
+    except JevProtocolError:
+        pass
+    else:
+        raise AssertionError("expected JevProtocolError")
+    assert models_sent(transport) == ["other/model"]
+    assert transport.calls == 1
+
+
+def test_a_failing_fallback_reports_both_models():
+    transport = ScriptedTransport([(404, {"error": {"message": "no such model"}}),
+                                   (404, {"error": {"message": "also missing"}})])
+    try:
+        decide(transport)
+    except JevTransientError as exc:
+        message = str(exc)
+        assert "typesafe/jev-1.13" in message and "respan/span-01-lite" in message
+    else:
+        raise AssertionError("expected JevTransientError")
+
+
+def test_a_failing_fallback_is_not_retried_forever():
+    transport = ScriptedTransport([(500, {"error": {"message": "down"}})])
+    try:
+        decide(transport, jev_max_retries=2)
+    except JevTransientError:
+        pass
+    else:
+        raise AssertionError("expected JevTransientError")
+    assert transport.calls == 4, "2 primary + 2 fallback, not an unbounded chain"
 
 
 # --- The shared mock -------------------------------------------------------- #

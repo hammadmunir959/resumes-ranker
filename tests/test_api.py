@@ -7,7 +7,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app import config
-from app.api import create_app
+from app.main import create_app
 from app.config import Settings, get_settings
 from app.exceptions import (
     ConfigError,
@@ -17,8 +17,8 @@ from app.exceptions import (
     JevProtocolError,
     JevTransientError,
 )
-from app.jev_client import JevClient
-from app.service import ResumeRanker
+from app.services import JevClient
+from app.services import ResumeRanker
 from app.testing import MockTransport, ScriptedTransport
 
 CRITERIA = [

@@ -1,18 +1,22 @@
-"""Settings, loaded and validated once from the environment or a ``.env`` file.
+"""Runtime configuration: validated once, at the edge.
 
-Every field accepts either its environment variable or its Python name. The
-Python name is listed first in each ``AliasChoices`` because pydantic resolves
-the choices left to right, which gives the precedence a caller expects:
+The environment is used for exactly one thing, the API key. Everything else is a
+default in this file, or an argument a caller passes in code. That is a
+deliberate trade: a deployment that wants different numbers changes the code or
+passes ``Settings.build(...)``, and in exchange there is no ambient configuration
+to be perturbed by a stray shell variable.
 
-    explicit argument  >  real environment  >  .env file  >  default
+Key resolution order, which is the only place the environment is consulted:
 
-That ordering matters: it means ``Settings.build(jev_max_rps=5)`` means the same
-thing on a developer machine that happens to export ``JEV_MAX_RPS`` as it does in
-CI, so tests cannot be perturbed by ambient configuration.
+    explicit argument  >  real environment  >  .env file
 
-The only required value is the OpenRouter key, and it is looked up under both
-``OPENROUTER_API_KEY`` and ``OPEN_ROUTER_KEY`` so an existing ``.env`` keeps
-working.
+``Settings.build(...)`` therefore means the same thing on a developer machine
+that happens to export variables as it does in CI, so tests cannot be perturbed
+by their surroundings.
+
+The key is looked up under both ``OPENROUTER_API_KEY`` and ``OPEN_ROUTER_KEY``
+so an existing ``.env`` keeps working, and "which name won" is decided by code
+below rather than by a library's source ordering.
 """
 
 from __future__ import annotations
@@ -23,13 +27,13 @@ from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
-from pydantic import AliasChoices, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.exceptions import ConfigError
 
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 DEFAULT_MODEL = "typesafe/jev-1.13"
+DEFAULT_FALLBACK_MODEL = "respan/span-01-lite"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/alpha/decisions"
 
 #: Loopback hosts allowed to use plain http, so a local mock server works.
@@ -59,77 +63,55 @@ def is_safe_base_url(url: str) -> bool:
     return (urlparse(url).hostname or "") in _LOOPBACK_HOSTS
 
 
-class Settings(BaseSettings):
-    """Validated runtime configuration."""
+class Settings(BaseModel):
+    """Validated configuration for one process.
 
-    model_config = SettingsConfigDict(
-        env_file=ENV_PATH,
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
-    )
+    A plain model rather than an env-driven one, so a value is always either a
+    default written here or something a caller passed explicitly. There is no
+    third source that can change behaviour without appearing in the code.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     #: Checked in order; the canonical name wins when both are set.
     api_key_names: ClassVar[tuple[str, ...]] = ("OPENROUTER_API_KEY", "OPEN_ROUTER_KEY")
 
-    # Deliberately has no env alias. The key is resolved explicitly in
-    # __init__ so that "which of the two names won" is decided by code we can
-    # read and test, rather than by pydantic-settings' source ordering.
     openrouter_api_key: str = Field(default="", repr=False)
-    jev_model: str = Field(
-        default=DEFAULT_MODEL,
-        validation_alias=AliasChoices("jev_model", "JEV_MODEL"),
-    )
-    jev_base_url: str = Field(
-        default=DEFAULT_BASE_URL,
-        validation_alias=AliasChoices("jev_base_url", "JEV_BASE_URL"),
-    )
-    jev_max_concurrency: int = Field(
-        default=10, ge=1, le=64,
-        validation_alias=AliasChoices("jev_max_concurrency", "JEV_MAX_CONCURRENCY"),
-    )
-    jev_max_rps: float = Field(
-        default=20.0, gt=0,
-        validation_alias=AliasChoices("jev_max_rps", "JEV_MAX_RPS"),
-    )
-    jev_max_retries: int = Field(
-        default=4, ge=1, le=10,
-        validation_alias=AliasChoices("jev_max_retries", "JEV_MAX_RETRIES"),
-    )
-    jev_backoff_base: float = Field(
-        default=1.5, gt=0,
-        validation_alias=AliasChoices("jev_backoff_base", "JEV_BACKOFF_BASE"),
-    )
-    jev_backoff_max: float = Field(
-        default=30.0, gt=0,
-        validation_alias=AliasChoices("jev_backoff_max", "JEV_BACKOFF_MAX"),
-    )
-    jev_timeout: float = Field(
-        default=60.0, gt=0,
-        validation_alias=AliasChoices("jev_timeout", "JEV_TIMEOUT"),
-    )
-    jev_max_batch_size: int = Field(
-        default=100, ge=1,
-        validation_alias=AliasChoices("jev_max_batch_size", "JEV_MAX_BATCH_SIZE"),
-    )
-    host: str = Field(default="0.0.0.0", validation_alias=AliasChoices("host", "HOST"))
-    port: int = Field(default=8000, ge=1, le=65535,
-                      validation_alias=AliasChoices("port", "PORT"))
-    log_level: str = Field(
-        default="INFO",
-        validation_alias=AliasChoices("log_level", "LOG_LEVEL"),
-    )
+    jev_model: str = DEFAULT_MODEL
+    #: Used when the primary model is the reason a call failed. Empty disables
+    #: the fallback, which is how you turn it off without changing anything else.
+    jev_fallback_model: str = DEFAULT_FALLBACK_MODEL
+    jev_base_url: str = DEFAULT_BASE_URL
 
-    # -- construction ------------------------------------------------------ #
+    # -- transport ---------------------------------------------------------- #
+
+    jev_max_concurrency: int = Field(default=10, ge=1, le=64)
+    jev_max_rps: float = Field(default=20.0, gt=0)
+    jev_max_retries: int = Field(default=4, ge=1, le=10)
+    jev_backoff_base: float = Field(default=1.5, gt=0)
+    jev_backoff_max: float = Field(default=30.0, gt=0)
+    jev_timeout: float = Field(default=60.0, gt=0)
+    jev_max_batch_size: int = Field(default=100, ge=1)
+
+    # -- server ------------------------------------------------------------- #
+
+    host: str = "0.0.0.0"
+    port: int = Field(default=8000, ge=1, le=65535)
+    log_level: str = "INFO"
+
+    # -- construction ------------------------------------------------------- #
 
     def __init__(self, **values: Any):
-        """Resolve the API key, then validate as usual.
-
-        The key is looked for under both accepted names, in this order:
-        an explicit argument, the real environment, then the ``.env`` file.
-        Doing it here rather than in a validator keeps the rule in one readable
-        place instead of depending on how pydantic-settings orders its sources.
-        """
+        """Resolve the API key from the environment, then validate as usual."""
+        # The environment spelling of the key is accepted as a keyword too, so
+        # ``Settings.build(OPENROUTER_API_KEY=...)`` works the way a caller who
+        # has the name in front of them would expect. It is consumed here
+        # rather than declared as a field, because the key is the one value
+        # resolved by hand.
+        for name in self.api_key_names:
+            alias = values.pop(name, None)
+            if alias is not None and not values.get("openrouter_api_key"):
+                values["openrouter_api_key"] = alias
         super().__init__(**{**values, "openrouter_api_key": self._find_key(values)})
 
     @classmethod
@@ -149,7 +131,7 @@ class Settings(BaseSettings):
             + f" in the environment or in {ENV_PATH}"
         )
 
-    # -- validation -------------------------------------------------------- #
+    # -- validation --------------------------------------------------------- #
 
     @field_validator("openrouter_api_key")
     @classmethod
@@ -175,24 +157,12 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {sorted(allowed)}")
         return upper
 
-    # -- derived ----------------------------------------------------------- #
+    # -- derived ------------------------------------------------------------ #
 
     @property
     def uses_mock_key(self) -> bool:
         """True when running against a local mock with a placeholder key."""
         return self.openrouter_api_key.startswith("mock-")
-
-    def public_dict(self) -> dict[str, Any]:
-        """Settings safe to expose over HTTP. Never includes the key."""
-        return {
-            "model": self.jev_model,
-            "base_url": self.jev_base_url,
-            "max_concurrency": self.jev_max_concurrency,
-            "max_requests_per_second": self.jev_max_rps,
-            "max_retries": self.jev_max_retries,
-            "timeout_seconds": self.jev_timeout,
-            "max_batch_size": self.jev_max_batch_size,
-        }
 
     @classmethod
     def build(cls, **overrides: Any) -> "Settings":
@@ -245,6 +215,7 @@ __all__ = [
     "is_safe_base_url",
     "ConfigError",
     "DEFAULT_MODEL",
+    "DEFAULT_FALLBACK_MODEL",
     "DEFAULT_BASE_URL",
     "ENV_PATH",
 ]

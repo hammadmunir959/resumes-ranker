@@ -31,6 +31,8 @@ def test_build_uses_a_placeholder_key():
 
 
 def test_env_var_name_is_accepted():
+    # The key is the one value the environment supplies, so the canonical name
+    # is accepted as well as the Python field name.
     assert Settings.build(OPENROUTER_API_KEY="sk-or-a").openrouter_api_key == "sk-or-a"
 
 
@@ -95,14 +97,6 @@ def test_insecure_base_url_is_rejected():
 def test_loopback_base_url_is_allowed_for_the_mock():
     settings = Settings.build(jev_base_url="http://127.0.0.1:8078/api/alpha/decisions")
     assert settings.jev_base_url.endswith("/api/alpha/decisions")
-
-
-def test_public_dict_never_exposes_the_key():
-    settings = Settings.build(openrouter_api_key="sk-or-supersecret")
-    public = settings.public_dict()
-    assert "supersecret" not in repr(public)
-    assert "api_key" not in public
-    assert public["model"] == DEFAULT_MODEL
 
 
 def test_repr_hides_the_key():

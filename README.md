@@ -47,11 +47,21 @@ resume-ranker-api                  # http://0.0.0.0:8000
 ```
 
 To exercise the real HTTP path with no credit, run the mock Decisions API in one
-terminal and point the app at it in another:
+terminal and point the app at it in another. Only the key comes from the
+environment, so the base URL is passed in code:
 
 ```bash
 resume-ranker-mock
-JEV_BASE_URL=http://127.0.0.1:8078/api/alpha/decisions resume-ranker-api
+```
+
+```python
+# other terminal
+import uvicorn
+from app.config import Settings
+from app.main import create_app
+from app.testing import MOCK_BASE_URL
+
+uvicorn.run(create_app(Settings.build(jev_base_url=MOCK_BASE_URL)))
 ```
 
 Against live OpenRouter, set a key:
@@ -138,31 +148,54 @@ the same answer N times.
 
 ## Configuration
 
-Every field is read from the environment or a `.env` file, and any of them can
-be passed explicitly. The key is read under either `OPENROUTER_API_KEY` or
-`OPEN_ROUTER_KEY`; an explicit argument wins over the environment, which wins
-over `.env`.
+The environment is used for exactly one thing: the API key, read under either
+`OPENROUTER_API_KEY` or `OPEN_ROUTER_KEY`, with an explicit argument winning over
+the environment, which wins over `.env`.
 
-| Variable              | Default                                       | Notes                              |
-| --------------------- | --------------------------------------------- | ---------------------------------- |
-| `OPENROUTER_API_KEY`  | required                                      | Never logged or returned by the API |
-| `JEV_MODEL`           | `typesafe/jev-1.13`                           |                                    |
-| `JEV_BASE_URL`        | `https://openrouter.ai/api/alpha/decisions`  | https, except on loopback          |
-| `JEV_MAX_CONCURRENCY` | `10`                                          | 1-64                               |
-| `JEV_MAX_RPS`         | `20.0`                                        | Client-side rate limit             |
-| `JEV_MAX_RETRIES`     | `4`                                           | 1-10                               |
-| `JEV_BACKOFF_BASE`    | `1.5`                                         |                                    |
-| `JEV_BACKOFF_MAX`     | `30.0`                                        |                                    |
-| `JEV_TIMEOUT`         | `60.0`                                        | Seconds                            |
-| `JEV_MAX_BATCH_SIZE`  | `100`                                         |                                    |
-| `HOST`, `PORT`        | `0.0.0.0`, `8000`                             | API bind address                   |
-| `LOG_LEVEL`           | `INFO`                                        |                                    |
+Everything else is a default in `app/config.py`, or an argument you pass:
 
-`JEV_BASE_URL` is rejected unless it is https or a loopback address: a plain
+```python
+ResumeRanker.from_settings(Settings.build(jev_model="other/model"))
+```
+
+That is a deliberate trade. In exchange for a little editing when a deployment
+needs different numbers, there is no ambient configuration that can change
+behaviour without appearing in the code - which is also what lets the test suite
+be immune to whatever the shell happens to export.
+
+| `Settings` field        | Default                                       | Notes                              |
+| ----------------------- | --------------------------------------------- | ---------------------------------- |
+| `openrouter_api_key`    | required                                      | Never logged or returned by the API |
+| `jev_model`             | `typesafe/jev-1.13`                           |                                    |
+| `jev_fallback_model`    | `respan/span-01-lite`                         | Empty disables the fallback        |
+| `jev_base_url`          | `https://openrouter.ai/api/alpha/decisions`   | https, except on loopback          |
+| `jev_max_concurrency`   | `10`                                          | 1-64                               |
+| `jev_max_rps`           | `20.0`                                        | Client-side rate limit             |
+| `jev_max_retries`       | `4`                                           | 1-10                               |
+| `jev_backoff_base`      | `1.5`                                         |                                    |
+| `jev_backoff_max`       | `30.0`                                        |                                    |
+| `jev_timeout`           | `60.0`                                        | Seconds                            |
+| `jev_max_batch_size`    | `100`                                         |                                    |
+| `host`, `port`          | `0.0.0.0`, `8000`                             | API bind address                   |
+| `log_level`             | `INFO`                                        |                                    |
+
+`jev_base_url` is rejected unless it is https or a loopback address: a plain
 http endpoint anywhere else would put the key on the wire in the clear.
 
 Rate limits and backoff are applied client-side, so a large pool does not
 exhaust the account's in-flight budget.
+
+### When the primary model is the problem
+
+If a call fails for a reason that belongs to the model rather than the account -
+unknown model, rejected request, or a provider error that survived the retries -
+the client makes one more pass with `jev_fallback_model`. A bad key or an empty
+balance does not fall back, because the fallback would be turned away for exactly
+the same reason and the extra request would only delay the real message.
+
+Results report the model that actually answered, per candidate and for the batch,
+so a fallback is visible in the output rather than silent. Passing `model=` to
+`JevClient.decide` means you want that one model, so it is never substituted.
 
 ## Limits
 
@@ -177,7 +210,7 @@ made, rather than after paying for a partial run.
 python tests/run.py
 ```
 
-262 tests, no pytest required. They are plain `test_*` functions with bare
+273 tests, no pytest required. They are plain `test_*` functions with bare
 asserts, so they also run unchanged under pytest if it is ever installed.
 
 The mock is keyword-overlap, not a model. It exists to make demos and tests
@@ -188,16 +221,32 @@ never passes a gate or earns a rubric level, whatever the noise term does.
 
 ```
 app/
+  main.py         the process: ASGI app, lifespan, error handler, health
+  config.py       defaults, key resolution from the environment, validation
   exceptions.py   one hierarchy; each class carries its own HTTP status
-  config.py       settings, key resolution, validation
-  schemas.py      every Pydantic model, used by all layers
-  jev_client.py   the Decisions API client, with retries and rate limiting
-  service.py      criteria -> questions -> scores, and the ranker
-  api.py          FastAPI app factory, routes, error mapping
   cli.py          interactive tester
   testing.py      the mock, shared by the tests and the CLI
+  schemas/        shapes, split by whose API they describe
+    jev_schemas.py       the Decisions wire format
+    ranking_schemas.py   criteria, candidates, scores, request envelopes
+    health_schemas.py    the /health payload
+  services/       the stateful objects
+    jev_service.py       the Decisions client: retries, rate limit, fallback
+    ranking_service.py   ResumeRanker
+  utils/          pure functions, no state and no I/O
+    jev_utils.py         fallback choice, Retry-After, non-JSON bodies
+    ranking_utils.py     criteria -> questions -> scores, and the thresholds
+  api/
+    ranking_router.py    the two ranking routes
 tests/            one module per app module, plus a small runner
 ```
+
+The rule the layout follows: each package holds one kind of thing, and a question
+has one place to be answered. `schemas` is shapes, `services` is stateful
+objects, `utils` is pure functions, `api` is routes, and `main` is the process
+that wires them together. The `__init__.py` of each subpackage re-exports its
+public surface, so callers import `from app.services import ResumeRanker` rather
+than reaching into a module.
 
 `app/testing.py` is deliberately part of the package: the CLI demos and the test
 suite share one mock, so a green test run also means the demo works.

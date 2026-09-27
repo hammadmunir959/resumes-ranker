@@ -1,42 +1,28 @@
-"""FastAPI application exposing the ranker over HTTP.
+"""The process: the ASGI app, its lifespan, and the uvicorn entry point.
 
-Three endpoints:
+Everything that belongs to the process rather than to a feature lives here -
+startup and shutdown, the single error handler, the health endpoint - and the
+feature routers are attached to it. Adding a feature therefore means adding a
+router in :mod:`app.api`, not editing this file.
 
-* ``GET  /health``    liveness, plus the configuration actually loaded
-* ``POST /rank/single``  rank one candidate
-* ``POST /rank/batch``   rank a pool concurrently
-
-Both rank endpoints return the same :class:`~app.schemas.RankingResult` shape;
-single is just a batch of one, so clients only handle one format.
-
-Errors are handled in one place. Every exception in :mod:`app.exceptions`
-carries its own ``http_status`` and ``error_code``, so this module needs a
-single handler and no mapping table that could drift away from the classes.
-
-Settings are resolved inside the lifespan rather than at import, so
-``uvicorn app.api:app`` starts even with a missing or broken key and reports it
-as a 503 per request, instead of failing to import and crash-looping.
+This is also the module a deployment points at: ``uvicorn app.main:app``.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.api import ranking_router
 from app.config import Settings
 from app.exceptions import ConfigError, RankerError
-from app.schemas import (
-    HealthResponse,
-    RankBatchRequest,
-    RankSingleRequest,
-    RankingResult,
-)
-from app.service import ResumeRanker
+from app.schemas import HealthResponse
+from app.services import ResumeRanker
+from app.utils import resolve_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +59,9 @@ def create_app(
         app.state.ranker = resolved
         app.state.error = None
         logger.info(
-            "Resumes Ranker ready: model=%s base_url=%s key=%s",
+            "Resumes Ranker ready: model=%s fallback=%s base_url=%s key=%s",
             resolved.settings.jev_model,
+            resolve_fallback(resolved.settings, resolved.settings.jev_model) or "none",
             resolved.settings.jev_base_url,
             "mock" if resolved.settings.uses_mock_key else "configured",
         )
@@ -97,15 +84,6 @@ def create_app(
             logger.warning("%s: %s", type(exc).__name__, exc)
         return JSONResponse(status_code=exc.http_status, content=exc.to_payload())
 
-    def get_ranker(request: Request) -> ResumeRanker:
-        """The shared ranker, or the reason there isn't one."""
-        error: Optional[RankerError] = getattr(request.app.state, "error", None)
-        if error is not None:
-            raise error
-        return request.app.state.ranker
-
-    RankerDep = Depends(get_ranker)
-
     @app.get("/health", response_model=HealthResponse, tags=["meta"])
     async def health(request: Request) -> HealthResponse:
         """Liveness and loaded configuration. Never calls the provider.
@@ -118,6 +96,7 @@ def create_app(
         return HealthResponse(
             status="ok",
             model=settings.jev_model,
+            fallback_model=resolve_fallback(settings, settings.jev_model) or "",
             base_url=settings.jev_base_url,
             key_configured=bool(settings.openrouter_api_key),
             mock_key=settings.uses_mock_key,
@@ -126,42 +105,7 @@ def create_app(
             max_batch_size=settings.jev_max_batch_size,
         )
 
-    @app.post("/rank/single", response_model=RankingResult, tags=["rank"])
-    async def rank_single(
-        payload: RankSingleRequest,
-        ranker: ResumeRanker = RankerDep,
-    ) -> RankingResult:
-        """Rank one candidate. Upstream errors are raised, not hidden.
-
-        Wrapped in a one-element :class:`RankingResult` rather than returned as a
-        bare ``CandidateScore``, so a client only ever parses one response shape.
-        """
-        started = time.monotonic()
-        score = await ranker.rank_single(
-            job_description=payload.job_description,
-            criteria=payload.criteria,
-            candidate=payload.candidate,
-        )
-        return RankingResult(
-            model=ranker.settings.jev_model,
-            results=[score],
-            total_cost_usd=score.cost_usd or 0.0,
-            elapsed_seconds=round(time.monotonic() - started, 3),
-        )
-
-    @app.post("/rank/batch", response_model=RankingResult, tags=["rank"])
-    async def rank_batch(
-        payload: RankBatchRequest,
-        ranker: ResumeRanker = RankerDep,
-    ) -> RankingResult:
-        """Rank a pool concurrently. Gated-out candidates sort last."""
-        return await ranker.rank_batch(
-            job_description=payload.job_description,
-            criteria=payload.criteria,
-            candidates=payload.candidates,
-            max_concurrency=payload.max_concurrency,
-        )
-
+    app.include_router(ranking_router.router)
     return app
 
 
@@ -177,14 +121,14 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
     uvicorn.run(
-        "app.api:app",
+        "app.main:app",
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level.lower(),
     )
 
 
-# Module-level app for `uvicorn app.api:app`. Settings are resolved in the
+# Module-level app for `uvicorn app.main:app`. Settings are resolved in the
 # lifespan, so importing this module never requires a configured key.
 app = create_app()
 

@@ -22,14 +22,14 @@ from typing import Any, Optional, Sequence
 
 from app.config import Settings
 from app.exceptions import RankerError
-from app.jev_client import JevClient
+from app.services import JevClient
 from app.schemas import (
     Candidate,
     CandidateScore,
     Criterion,
     RankingResult,
 )
-from app.service import ResumeRanker
+from app.services import ResumeRanker
 from app.testing import MockTransport
 
 try:

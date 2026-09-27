@@ -1,14 +1,11 @@
-"""Every model in the project, in one place.
+"""What this program judges: the inputs, the per-candidate results, and the
+envelopes the API wraps them in.
 
-The old layout had domain dataclasses in ``service.py`` and a second, parallel
-set of Pydantic request/response models in ``api.py``, joined by
-``to_domain()`` / ``from_domain()`` translation functions that had to be kept in
-step by hand. Here there is one definition per shape, used by the service, the
-API, the CLI, and the tests alike.
+Separate from :mod:`app.schemas.jev_schemas` because these shapes are ours. They
+describe the ranking job and its answer, and they are what the CLI, the API, and
+a library caller all pass around.
 
-Validation lives on the models, so an invalid criterion or a 500-candidate batch
-is rejected before any code starts ranking, and the API gets that for free from
-FastAPI rather than from a hand-written handler.
+Each cap below is enforced by the model that uses it.
 """
 
 from __future__ import annotations
@@ -17,11 +14,15 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.exceptions import JevProtocolError
+from app.schemas.jev_schemas import Usage
 
-# --- Limits -----------------------------------------------------------------
-# Enforced by the models below, so they apply to the API, the CLI, and direct
-# library use alike.
+# --- Caps --------------------------------------------------------------------
+# Declared here because these models are what enforce them, and a bound baked
+# into a ``Field`` cannot be varied per instance. The cost of a request scales
+# with the number of criteria and candidates, so refusing an oversized payload
+# here is what stops a request that would be slow and expensive rather than
+# merely invalid.
+
 MAX_CRITERIA = 50
 MAX_CANDIDATES = 100
 MAX_CRITERION_NAME = 120
@@ -34,8 +35,24 @@ MAX_CANDIDATE_ID = 120
 #: question reports, so the order is significant.
 DEFAULT_RUBRIC: tuple[str, ...] = ("Not met", "Partially met", "Fully met")
 
-#: Default output scale for a weighted score.
-SCORE_SCALE = 100.0
+__all__ = [
+    "DEFAULT_RUBRIC",
+    "MAX_CRITERIA",
+    "MAX_CANDIDATES",
+    "MAX_CANDIDATE_ID",
+    "MAX_JOB_DESCRIPTION",
+    "MAX_RESUME_TEXT",
+    "MAX_APPLICATION_FORM",
+    "MAX_CRITERION_NAME",
+    "Criterion",
+    "Candidate",
+    "CriterionOutcome",
+    "CandidateScore",
+    "RankingResult",
+    "RankRequestBase",
+    "RankSingleRequest",
+    "RankBatchRequest",
+]
 
 
 class _Frozen(BaseModel):
@@ -134,156 +151,6 @@ class Candidate(_Frozen):
 
 
 # --------------------------------------------------------------------------- #
-# Jev wire format
-# --------------------------------------------------------------------------- #
-
-class ScoreAnswer(BaseModel):
-    """A position on an ordered rubric, with the model's full distribution.
-
-    ``score`` is the model's chosen position, which can fall between two levels.
-    ``probabilities`` and ``legend`` are the distribution behind that choice.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    question_id: str
-    score: float
-    confidence: Optional[float] = None
-    probabilities: dict[str, float] = Field(default_factory=dict)
-    legend: dict[str, str] = Field(default_factory=dict)
-
-    def expected_score(self) -> float:
-        """Mean position implied by the distribution.
-
-        Usually the same as ``score``; worth reading when the model spread its
-        probability thinly and the point estimate overstates the confidence.
-        """
-        if not self.probabilities:
-            return self.score
-        total = 0.0
-        for key, weight in self.probabilities.items():
-            try:
-                total += float(key) * float(weight)
-            except (TypeError, ValueError):
-                continue
-        return total
-
-
-class ChoiceAnswer(BaseModel):
-    """One selected option out of those offered."""
-
-    model_config = ConfigDict(extra="allow")
-
-    question_id: str
-    choice: str
-    confidence: Optional[float] = None
-
-
-class Usage(BaseModel):
-    """Token counts and cost as reported by the provider."""
-
-    model_config = ConfigDict(extra="allow")
-
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cost_usd: Optional[float] = None
-
-    @property
-    def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
-
-
-class JevResponse(BaseModel):
-    """One Decisions response, normalized and typed.
-
-    ``answers`` is keyed by question id, matching the ids the caller sent.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    answers: dict[str, Any] = Field(default_factory=dict)
-    model: str = ""
-    cost_usd: Optional[float] = None
-    input_tokens: int = 0
-    output_tokens: int = 0
-    #: HTTP attempts this answer took, including the successful one.
-    attempts: int = 1
-    #: The untouched body, kept for debugging. Not serialized in API responses.
-    raw: dict[str, Any] = Field(default_factory=dict, repr=False)
-
-    @property
-    def usage(self) -> Usage:
-        return Usage(
-            input_tokens=self.input_tokens,
-            output_tokens=self.output_tokens,
-            cost_usd=self.cost_usd,
-        )
-
-    def answer(self, question_id: str) -> Optional[dict[str, Any]]:
-        """The raw answer for one question, or None if the model omitted it."""
-        value = self.answers.get(question_id)
-        return value if isinstance(value, dict) else None
-
-    def confidence(self, question_id: str) -> Optional[float]:
-        answer = self.answer(question_id)
-        if not answer:
-            return None
-        value = answer.get("confidence")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        return float(value)
-
-    def noul(self, question_id: str) -> float:
-        """Probability that a ``noul`` question is yes."""
-        answer = self.answer(question_id)
-        value = answer.get("noul") if answer else None
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise JevProtocolError(
-                f"question {question_id!r}: expected a noul answer, "
-                f"got {answer.get('type') if answer else None!r}"
-            )
-        return float(value)
-
-    def score(self, question_id: str) -> ScoreAnswer:
-        answer = self.answer(question_id)
-        value = answer.get("score") if answer else None
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise JevProtocolError(
-                f"question {question_id!r}: expected a score answer, "
-                f"got {answer.get('type') if answer else None!r}"
-            )
-        probabilities = answer.get("probabilities")
-        legend = answer.get("legend")
-        return ScoreAnswer(
-            question_id=question_id,
-            score=float(value),
-            confidence=self.confidence(question_id),
-            probabilities=(
-                {str(k): float(v) for k, v in probabilities.items()}
-                if isinstance(probabilities, dict)
-                else {}
-            ),
-            legend=(
-                {str(k): str(v) for k, v in legend.items()}
-                if isinstance(legend, dict)
-                else {}
-            ),
-        )
-
-    def choice(self, question_id: str) -> ChoiceAnswer:
-        answer = self.answer(question_id)
-        value = answer.get("choice") if answer else None
-        if not isinstance(value, str):
-            raise JevProtocolError(
-                f"question {question_id!r}: expected a choice answer, "
-                f"got {answer.get('type') if answer else None!r}"
-            )
-        return ChoiceAnswer(
-            question_id=question_id, choice=value, confidence=self.confidence(question_id)
-        )
-
-
-# --------------------------------------------------------------------------- #
 # Outputs
 # --------------------------------------------------------------------------- #
 
@@ -322,6 +189,9 @@ class CandidateScore(BaseModel):
 
     candidate_id: str
     gate_passed: bool = True
+    #: The model that actually answered. Differs from the configured primary when
+    #: the Jev service fell back, so a report cannot claim the wrong model.
+    model: str = ""
     #: 0-100 weighted score, or None when no weighted criterion contributed.
     #: None is different from 0.0: 0.0 means "scored and earned nothing", while
     #: None means there was nothing to score, as for a job of pure gates.
@@ -466,46 +336,3 @@ class RankBatchRequest(RankRequestBase):
         if duplicates:
             raise ValueError(f"duplicate candidate ids: {sorted(duplicates)}")
         return self
-
-
-class HealthResponse(BaseModel):
-    """Liveness plus the configuration a client would need to debug a failure.
-
-    Reports the base URL and model so an operator can see what the process
-    actually loaded. The key is never included, only whether one was found.
-    """
-
-    status: str
-    model: str
-    base_url: str
-    key_configured: bool
-    mock_key: bool = False
-    max_concurrency: int
-    max_requests_per_second: float
-    max_batch_size: int
-
-
-__all__ = [
-    "DEFAULT_RUBRIC",
-    "SCORE_SCALE",
-    "MAX_CRITERIA",
-    "MAX_CANDIDATES",
-    "MAX_CANDIDATE_ID",
-    "MAX_JOB_DESCRIPTION",
-    "MAX_RESUME_TEXT",
-    "MAX_APPLICATION_FORM",
-    "MAX_CRITERION_NAME",
-    "Criterion",
-    "Candidate",
-    "ScoreAnswer",
-    "ChoiceAnswer",
-    "Usage",
-    "JevResponse",
-    "CriterionOutcome",
-    "CandidateScore",
-    "RankingResult",
-    "RankRequestBase",
-    "RankSingleRequest",
-    "RankBatchRequest",
-    "HealthResponse",
-]
